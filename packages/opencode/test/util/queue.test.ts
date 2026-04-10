@@ -22,10 +22,12 @@ describe("AsyncQueue", () => {
   test("handles mixed push-before and push-after patterns", async () => {
     const q = new AsyncQueue<number>()
     q.push(10)
+    // p resolves immediately with 10 since it was already queued
     const p = q.next()
     q.push(20)
-    expect(await q.next()).toBe(10)
-    expect(await p).toBe(20)
+    // now only 20 remains in the queue
+    expect(await p).toBe(10)
+    expect(await q.next()).toBe(20)
   })
 
   test("asyncIterator yields pushed values", async () => {
@@ -87,12 +89,11 @@ describe("work", () => {
   })
 
   test("handles single concurrency", async () => {
-    const order: number[] = []
+    const processed: number[] = []
     await work(1, [1, 2, 3], async (item) => {
-      order.push(item)
+      processed.push(item)
     })
-    // with concurrency=1, items are popped from the end
-    expect(order.length).toBe(3)
-    expect(order.sort((a, b) => a - b)).toEqual([1, 2, 3])
+    expect(processed.length).toBe(3)
+    expect(processed.sort((a, b) => a - b)).toEqual([1, 2, 3])
   })
 })
