@@ -1,12 +1,24 @@
-import { createMemo, createSignal, ErrorBoundary, For, Match, onCleanup, Show, Switch, untrack, type JSX } from "solid-js"
+import {
+  createMemo,
+  createSignal,
+  ErrorBoundary,
+  For,
+  Match,
+  onCleanup,
+  Show,
+  Switch,
+  untrack,
+  type JSX,
+} from "solid-js"
 import { createStore } from "solid-js/store"
 import { Dynamic } from "solid-js/web"
-import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { Button } from "@opencode/ui/button"
+import { useDialog } from "@opencode/ui/context/dialog"
 import { FileIcon } from "@opencode/ui/file-icon"
+import { ImagePreview } from "@opencode/ui/image-preview"
 import { SegmentedControl, SegmentedControlItem } from "@opencode/ui/segmented-control"
-import { ScrollView } from "@opencode/ui/scroll-view"
+import { Loader } from "@opencode/ui/loader"
 import { Markdown } from "@opencode/session-ui/markdown"
 import { MarkdownProvider, useMarkdown } from "@opencode/session-ui/context/markdown"
 import { artifactKind, type ArtifactKind } from "@opencode/util/artifact"
@@ -37,8 +49,6 @@ type ViewerState = {
   /** Why the file shows as binary, when a viewer said. */
   readonly reason?: string
 }
-
-type ImageZoom = { readonly url: string; readonly zoom: "fit" | "actual"; readonly overflow: boolean }
 
 type MediaProps = {
   path: string
@@ -114,7 +124,7 @@ export default function ArtifactView(props: {
   // A file that fails also drops the facts its viewer reported, such as a page count.
   const fail = (reason?: string) => change({ undecodable: true, info: {}, reason })
 
-  const media = { onInfo: (info: ArtifactInfo) => change({ info }), onError: () => fail() }
+  const media = { onInfo: (info: ArtifactInfo) => change({ info }), onError: () => fail(ctx.t("view.loadFailed")) }
 
   const size = () => formatBytes(locale.locale(), contentBytes(props.content))
 
@@ -126,7 +136,7 @@ export default function ArtifactView(props: {
   })
 
   const rendered = () => (
-    <ScrollView class="min-h-0 flex-1">
+    <div class="min-h-0 flex-1 overflow-y-auto" data-scrollable>
       <Show
         when={kind() === "markdown"}
         fallback={<ArtifactMermaid text={props.content.content} cacheKey={props.cacheKey} />}
@@ -138,7 +148,7 @@ export default function ArtifactView(props: {
           cacheKey={props.cacheKey}
         />
       </Show>
-    </ScrollView>
+    </div>
   )
 
   return (
@@ -286,8 +296,11 @@ function OpenInBrowserButton(props: { session: MountedSession; path: string }) {
   )
 }
 
-function createBlobUrl(content: () => FileContent) {
+function createMediaUrl(content: () => FileContent) {
   return createMemo(() => {
+    const streamed = content().url
+
+    if (streamed) return streamed
     const value = blobUrlFromContent(content())
     onCleanup(() => URL.revokeObjectURL(value))
 
@@ -295,31 +308,107 @@ function createBlobUrl(content: () => FileContent) {
   })
 }
 
-/** Images and SVG previews: fit the pane, click to inspect at 1:1 when the image is larger. */
+/** Holds the pane until the media's first frame, so a file still streaming never shows as blank. */
+function MediaLoading() {
+  const ctx = useExtension()
+
+  return (
+    <div
+      role="status"
+      aria-label={ctx.t("common.loading")}
+      class="pointer-events-none absolute inset-0 flex items-center justify-center text-text-weak"
+    >
+      <Loader class="size-4" />
+    </div>
+  )
+}
+
+/** Images and SVG previews: each decoded image owns its viewport. */
 function ArtifactImage(props: MediaProps) {
-  const url = createBlobUrl(() => props.content)
-  const [size, setSize] = createStore({ width: 0, height: 0 })
-  // Zoom belongs to one image: a new one starts fitted.
-  const fitted = (): ImageZoom => ({ url: url(), zoom: "fit", overflow: false })
-  const [saved, setSaved] = createSignal(fitted())
+  const url = createMediaUrl(() => props.content)
 
-  const state = () => {
-    const value = saved()
+  return (
+    <Show when={url()} keyed>
+      {(src) => <ImageStage {...props} src={src} />}
+    </Show>
+  )
+}
 
-    return value.url === url() ? value : fitted()
+function ImageStage(props: MediaProps & { src: string }) {
+  const ctx = useExtension()
+
+  const [view, setView] = createStore({
+    width: 0,
+    height: 0,
+    imageWidth: 0,
+    imageHeight: 0,
+    zoom: 1,
+    x: 0,
+    y: 0,
+    dragging: false,
+  })
+
+  const fit = () =>
+    Math.min(
+      1,
+      Math.max(1, view.width - 48) / (view.imageWidth || 1),
+      Math.max(1, view.height - 48) / (view.imageHeight || 1),
+    )
+
+  const bound = (offset: number, image: number, zoom: number) => {
+    // Keep the fitted footprint covered, including its letterboxing. Clamping to
+    // the stage edges instead would move the anchor during small pinch increments.
+    const limit = (image * fit() * (zoom - 1)) / 2
+
+    return Math.max(-limit, Math.min(limit, offset))
   }
 
-  let stage: HTMLDivElement | undefined
+  const x = () => bound(view.x, view.imageWidth, view.zoom)
+  const y = () => bound(view.y, view.imageHeight, view.zoom)
+  const reset = () => setView({ zoom: 1, x: 0, y: 0 })
 
-  const measure = () => {
+  const pan = (left: number, top: number) =>
+    setView({ x: bound(left, view.imageWidth, view.zoom), y: bound(top, view.imageHeight, view.zoom) })
+
+  let stage: HTMLDivElement | undefined
+  let drag: { id: number; clientX: number; clientY: number; x: number; y: number } | undefined
+  let dragged = false
+
+  const cursor = () => {
+    if (view.zoom === 1) return undefined
+
+    return view.dragging ? "grabbing" : "grab"
+  }
+
+  const endDrag = (event: PointerEvent) => {
+    if (event.pointerId !== drag?.id) return
+
+    drag = undefined
+    setView("dragging", false)
+  }
+
+  const zoomAt = (zoom: number, clientX: number, clientY: number) => {
     if (!stage) return
 
-    setSaved({ ...state(), overflow: size.width > stage.clientWidth - 48 || size.height > stage.clientHeight - 48 })
+    const rect = stage.getBoundingClientRect()
+    const next = Math.max(1, Math.min(Math.max(8, 1 / fit()), zoom))
+    const ratio = next / view.zoom
+    const anchor = { x: clientX - rect.left - rect.width / 2, y: clientY - rect.top - rect.height / 2 }
+    setView({
+      zoom: next,
+      x: bound(anchor.x - (anchor.x - x()) * ratio, view.imageWidth, next),
+      y: bound(anchor.y - (anchor.y - y()) * ratio, view.imageHeight, next),
+    })
   }
 
   createResizeObserver(
     () => stage,
-    () => measure(),
+    () => {
+      if (!stage) return
+
+      setView({ width: stage.clientWidth, height: stage.clientHeight })
+      setView({ x: x(), y: y() })
+    },
   )
 
   return (
@@ -327,37 +416,101 @@ function ArtifactImage(props: MediaProps) {
       ref={stage}
       data-slot="artifact-stage"
       data-checker
-      data-zoom={state().zoom}
-      data-overflow={state().overflow || undefined}
-      class="relative min-h-0 flex-1 overflow-auto"
+      data-zoom={view.zoom === 1 ? "fit" : "actual"}
+      data-overflow={fit() < 1 || undefined}
+      class="relative min-h-0 flex-1 overflow-hidden"
+      on:wheel={(event) => {
+        if (!view.imageWidth || (!event.ctrlKey && view.zoom === 1)) return
+
+        // Chromium delivers trackpad pinch as Ctrl-wheel. Consume it here before
+        // Desktop's window-level zoom handler; ordinary fitted scrolling stays native.
+        event.preventDefault()
+        event.stopPropagation()
+        const unit = [1, 16, view.height][event.deltaMode] ?? 1
+
+        if (event.ctrlKey) {
+          zoomAt(view.zoom * Math.exp((-event.deltaY * unit) / 100), event.clientX, event.clientY)
+
+          return
+        }
+
+        // Use the OS's trackpad momentum directly, with no second animation loop.
+        pan(x() - event.deltaX * unit, y() - event.deltaY * unit)
+      }}
     >
-      <div
-        classList={{
-          "absolute inset-0 flex items-center justify-center p-6": state().zoom === "fit",
-          "flex min-h-full min-w-full w-max items-center justify-center p-6": state().zoom === "actual",
+      <img
+        data-slot="artifact-media"
+        src={props.src}
+        alt={getFilename(props.path)}
+        draggable={false}
+        class="absolute left-1/2 top-1/2 select-none"
+        style={{
+          width: view.imageWidth ? `${view.imageWidth * fit()}px` : undefined,
+          height: view.imageHeight ? `${view.imageHeight * fit()}px` : undefined,
+          "max-width": "none",
+          "max-height": "none",
+          transform: `translate(-50%, -50%) translate(${x()}px, ${y()}px) scale(${view.zoom})`,
+          "touch-action": view.zoom > 1 ? "none" : "auto",
+          cursor: cursor(),
         }}
-      >
-        <img
-          data-slot="artifact-media"
-          src={url()}
-          alt={getFilename(props.path)}
-          draggable={false}
-          onError={() => props.onError()}
-          onLoad={(event) => {
-            const image = event.currentTarget
+        onPointerDown={(event) => {
+          if (!event.isPrimary || event.button !== 0) return
 
-            setSize({ width: image.naturalWidth, height: image.naturalHeight })
-            props.onInfo({ width: image.naturalWidth, height: image.naturalHeight })
-            measure()
-          }}
-          onClick={() => {
-            const value = state()
+          dragged = false
 
-            if (!value.overflow && value.zoom === "fit") return
+          if (view.zoom === 1) return
 
-            setSaved({ ...value, zoom: value.zoom === "fit" ? "actual" : "fit" })
-          }}
-        />
+          drag = { id: event.pointerId, clientX: event.clientX, clientY: event.clientY, x: x(), y: y() }
+          event.currentTarget.setPointerCapture(event.pointerId)
+          setView("dragging", true)
+        }}
+        onPointerMove={(event) => {
+          if (!drag || drag.id !== event.pointerId) return
+
+          const dx = event.clientX - drag.clientX
+          const dy = event.clientY - drag.clientY
+
+          if (!dragged && Math.hypot(dx, dy) < 3) return
+
+          dragged = true
+          pan(drag.x + dx, drag.y + dy)
+        }}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onLostPointerCapture={endDrag}
+        onError={() => props.onError()}
+        onLoad={(event) => {
+          const image = event.currentTarget
+          const width = image.naturalWidth || image.width || image.clientWidth || 300
+          const height = image.naturalHeight || image.height || image.clientHeight || 150
+
+          setView({
+            imageWidth: width,
+            imageHeight: height,
+            width: stage?.clientWidth ?? 0,
+            height: stage?.clientHeight ?? 0,
+          })
+          props.onInfo({ width, height })
+        }}
+        onClick={(event) => {
+          if (dragged) {
+            dragged = false
+
+            return
+          }
+
+          if (view.zoom > 1) return reset()
+
+          zoomAt(1 / fit(), event.clientX, event.clientY)
+        }}
+      />
+      <Show when={!view.imageWidth}>
+        <MediaLoading />
+      </Show>
+      <div class="absolute end-3 top-3">
+        <Button size="small" variant="neutral" disabled={view.zoom === 1} onClick={reset}>
+          {ctx.t("view.fit")}
+        </Button>
       </div>
     </div>
   )
@@ -365,13 +518,13 @@ function ArtifactImage(props: MediaProps) {
 
 function ArtifactVideo(props: MediaProps) {
   const ctx = useExtension()
-  const url = createBlobUrl(() => props.content)
-  // Fullscreen belongs to one video: a new file starts fitted in the pane.
-  const [expandedUrl, setExpandedUrl] = createSignal<string>()
+  const dialog = useDialog()
+  const url = createMediaUrl(() => props.content)
+  const [loadedUrl, setLoadedUrl] = createSignal<string>()
   const [paused, setPaused] = createSignal(true)
   const [active, setActive] = createSignal(false)
+  const [open, setOpen] = createSignal(false)
   const [box, setBox] = createStore({ left: 0, top: 0, ready: false })
-  const expanded = () => expandedUrl() === url()
 
   let stage: HTMLDivElement | undefined
   let video: HTMLVideoElement | undefined
@@ -390,8 +543,17 @@ function ArtifactVideo(props: MediaProps) {
 
   onCleanup(clearIdle)
 
-  const close = () => setExpandedUrl(undefined)
-  const toggle = () => setExpandedUrl(expanded() ? undefined : url())
+  // The preview fills the window and borrows this <video> element, so playback carries on as it flies out and back.
+  const expand = () => {
+    const el = video
+
+    if (!el?.videoWidth || open() || !stage?.contains(el)) return
+    setOpen(true)
+    dialog.show(
+      () => <ImagePreview src={el.currentSrc} alt={getFilename(props.path)} video={el} />,
+      () => setOpen(false),
+    )
+  }
 
   const measure = () => {
     if (!video || video.offsetWidth === 0 || video.offsetHeight === 0) return
@@ -410,46 +572,13 @@ function ArtifactVideo(props: MediaProps) {
     () => measure(),
   )
 
-  // Top-layer promotion escapes the side panel's stacking context and <main>'s content containment
-  // while keeping the same <video> element mounted so playback never resets.
-  createKeyed(expanded, (open) => {
-    const el = stage
-
-    if (!el || !open) return
-
-    el.setAttribute("popover", "manual")
-    el.showPopover?.()
-    measure()
-
-    makeEventListener(
-      window,
-      "keydown",
-      (event: KeyboardEvent) => {
-        if (event.key !== "Escape") return
-
-        event.preventDefault()
-        event.stopPropagation()
-        close()
-      },
-      { capture: true },
-    )
-
-    onCleanup(() => {
-      if (el.isConnected) el.hidePopover?.()
-      el.removeAttribute("popover")
-      measure()
-    })
-  })
-
-  const label = () => ctx.t(expanded() ? "view.exitFullscreen" : "view.fullscreen")
-  const controlsVisible = () => paused() || active()
+  const controlsVisible = () => !open() && (paused() || active())
 
   return (
     <div
       ref={stage}
       data-slot="artifact-stage"
       data-zoom="fit"
-      data-expanded={expanded() ? "" : undefined}
       class="relative min-h-0 flex-1 overflow-hidden"
       onPointerMove={wake}
       onPointerLeave={() => {
@@ -457,15 +586,7 @@ function ArtifactVideo(props: MediaProps) {
         setActive(false)
       }}
     >
-      <div
-        classList={{
-          "absolute inset-0 flex items-center justify-center p-6": !expanded(),
-          "absolute inset-0 flex items-center justify-center px-8 pt-12 pb-8": expanded(),
-        }}
-        onClick={(event) => {
-          if (expanded() && event.target === event.currentTarget) close()
-        }}
-      >
+      <div class="absolute inset-0 flex items-center justify-center p-6">
         <video
           ref={video}
           data-slot="artifact-media"
@@ -475,7 +596,20 @@ function ArtifactVideo(props: MediaProps) {
           playsinline
           onError={() => props.onError()}
           src={url()}
-          onDblClick={toggle}
+          onClick={(event) => {
+            // Chromium's controls answer the second click of a double click with a native fullscreen request, which
+            // covers the preview the double click opens. Opting out with controlslist="nofullscreen" would also end
+            // their click-to-play. The fullscreen element ready check refuses an open popover, so the video is one
+            // while its controls handle this click, and is released before the next frame renders.
+            const el = event.currentTarget
+
+            // In native fullscreen, the controls' own exit must run; showPopover would throw there.
+            if (event.detail < 2 || document.fullscreenElement === el) return
+            el.setAttribute("popover", "manual")
+            el.showPopover?.()
+            requestAnimationFrame(() => el.removeAttribute("popover"))
+          }}
+          onDblClick={expand}
           onPlay={() => setPaused(false)}
           onPause={() => setPaused(true)}
           onEnded={() => setPaused(true)}
@@ -485,45 +619,33 @@ function ArtifactVideo(props: MediaProps) {
             props.onInfo({ width: el.videoWidth, height: el.videoHeight, duration: el.duration })
             measure()
           }}
+          onLoadedData={() => setLoadedUrl(url())}
         />
+        <Show when={loadedUrl() !== url()}>
+          <MediaLoading />
+        </Show>
         <button
           type="button"
           data-slot="artifact-video-fullscreen"
-          aria-label={label()}
-          aria-pressed={expanded()}
-          title={label()}
-          onClick={toggle}
+          aria-label={ctx.t("view.fullscreen")}
+          title={ctx.t("view.fullscreen")}
+          onClick={expand}
           style={box.ready ? { left: `${box.left}px`, top: `${box.top}px` } : { right: "72px", bottom: "48px" }}
           classList={{
-            "absolute z-10 flex size-12 items-center justify-center transition-opacity focus-visible:opacity-100 focus-visible:outline-none":
-              true,
+            "absolute z-10 flex size-12 items-center justify-center transition-opacity focus-visible:opacity-100 focus-visible:outline-none": true,
             "opacity-100": controlsVisible(),
             "pointer-events-none opacity-0": !controlsVisible(),
           }}
         >
           <span class="flex size-9 items-center justify-center rounded-full transition-colors">
-            <Show
-              when={expanded()}
-              fallback={
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path
-                    d="M3 6V3H6M10 3H13V6M13 10V13H10M6 13H3V10"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linecap="square"
-                  />
-                </svg>
-              }
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <path
-                  d="M3 5.5H5.5V3M13 5.5H10.5V3M10.5 13V10.5H13M5.5 13V10.5H3"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="square"
-                />
-              </svg>
-            </Show>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M3 6V3H6M10 3H13V6M13 10V13H10M6 13H3V10"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="square"
+              />
+            </svg>
           </span>
         </button>
       </div>
@@ -532,7 +654,7 @@ function ArtifactVideo(props: MediaProps) {
 }
 
 function ArtifactAudio(props: MediaProps) {
-  const url = createBlobUrl(() => props.content)
+  const url = createMediaUrl(() => props.content)
 
   return (
     <div data-slot="artifact-stage" class="relative min-h-0 flex-1 overflow-auto">
@@ -557,7 +679,7 @@ function ArtifactAudio(props: MediaProps) {
 }
 
 function ArtifactFrame(props: { path: string; content: FileContent; kind: "pdf" | "html" }) {
-  const url = createBlobUrl(() => props.content)
+  const url = createMediaUrl(() => props.content)
   // PDF Open Parameters: start with the thumbnail pane closed and the page fitted to the pane width.
   const src = () => (props.kind === "pdf" ? `${url()}#navpanes=0&view=FitH` : url())
 
@@ -645,7 +767,7 @@ const specimenSizes = [12, 16, 24, 40, 64]
 
 function ArtifactFont(props: { path: string; content: FileContent }) {
   const ctx = useExtension()
-  const url = createBlobUrl(() => props.content)
+  const url = createMediaUrl(() => props.content)
   const family = createMemo(() => `artifact-${Math.random().toString(36).slice(2)}`)
 
   // The document's font set holds the face while it shows.
