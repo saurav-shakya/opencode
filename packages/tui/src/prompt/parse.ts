@@ -14,6 +14,12 @@ export function fileLineRange(startLine: number, endLine?: number) {
   return { startLine, endLine: endLine !== undefined && endLine >= startLine ? endLine : undefined }
 }
 
+export function formatFileLineRange(range: { startLine: number; endLine?: number }) {
+  if (range.endLine === undefined) return `#${range.startLine}-`
+  if (range.endLine === range.startLine) return `#${range.startLine}`
+  return `#${range.startLine}-${range.endLine}`
+}
+
 export function stripFileLineRange(input: string) {
   return parseFileLineRange(input).base
 }

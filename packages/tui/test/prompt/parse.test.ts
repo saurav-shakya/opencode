@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { fileLineRange, parseFileLineRange, parseSlashHead } from "../../src/prompt/parse"
+import { fileLineRange, formatFileLineRange, parseFileLineRange, parseSlashHead } from "../../src/prompt/parse"
 
 test("preserves file line-range parsing semantics", () => {
   expect([
@@ -22,6 +22,12 @@ test("keeps a single-line range bounded instead of reading to the end of the fil
   expect(fileLineRange(10, 12)).toEqual({ startLine: 10, endLine: 12 })
   expect(fileLineRange(10, 9)).toEqual({ startLine: 10, endLine: undefined })
   expect(fileLineRange(10)).toEqual({ startLine: 10, endLine: undefined })
+})
+
+test("labels single-line, bounded, and open-ended ranges distinctly", () => {
+  expect(formatFileLineRange({ startLine: 10, endLine: 10 })).toBe("#10")
+  expect(formatFileLineRange({ startLine: 10, endLine: 12 })).toBe("#10-12")
+  expect(formatFileLineRange({ startLine: 10 })).toBe("#10-")
 })
 
 test("keeps frontend-specific slash separators", () => {
