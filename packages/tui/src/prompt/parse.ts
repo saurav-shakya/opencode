@@ -6,9 +6,18 @@ export function parseFileLineRange(input: string) {
   const match = input.slice(hash + 1).match(/^(\d+)(?:-(\d*))?$/)
   if (!match) return { base }
 
-  const startLine = Number(match[1])
-  const endLine = match[2] && startLine < Number(match[2]) ? Number(match[2]) : undefined
-  return { base, lineRange: { startLine, endLine } }
+  return { base, lineRange: fileLineRange(Number(match[1]), match[2] ? Number(match[2]) : undefined) }
+}
+
+// An end equal to the start is a single line; only a missing or earlier end means "to the end of the file".
+export function fileLineRange(startLine: number, endLine?: number) {
+  return { startLine, endLine: endLine !== undefined && endLine >= startLine ? endLine : undefined }
+}
+
+export function formatFileLineRange(range: { startLine: number; endLine?: number }) {
+  if (range.endLine === undefined) return `#${range.startLine}-`
+  if (range.endLine === range.startLine) return `#${range.startLine}`
+  return `#${range.startLine}-${range.endLine}`
 }
 
 export function stripFileLineRange(input: string) {

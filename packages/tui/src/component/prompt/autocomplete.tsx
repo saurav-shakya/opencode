@@ -23,7 +23,7 @@ import { mentionTriggerIndex, slashTriggerIndex } from "../../prompt/display"
 import type { FileSystemEntry } from "@opencode/client"
 import { Skill } from "@opencode/schema/skill"
 import { stringWidth } from "../../util/string-width"
-import { parseFileLineRange, stripFileLineRange } from "../../prompt/parse"
+import { fileLineRange, formatFileLineRange, parseFileLineRange, stripFileLineRange } from "../../prompt/parse"
 import { moveSelection, reconcileSelectionWindow, revealSelectionOffset } from "../../ui/select-controller"
 import { directoryAutocomplete, slashArgumentAutocomplete } from "../../prompt/directory-completion"
 
@@ -248,9 +248,7 @@ export function Autocomplete(props: {
   ) {
     const urlObj = pathToFileURL(filePath)
     const filename =
-      lineRange && item.type !== "directory"
-        ? `${item.path}#${lineRange.startLine}${lineRange.endLine ? `-${lineRange.endLine}` : ""}`
-        : item.path
+      lineRange && item.type !== "directory" ? `${item.path}${formatFileLineRange(lineRange)}` : item.path
 
     if (lineRange && item.type !== "directory") {
       urlObj.searchParams.set("start", String(lineRange.startLine))
@@ -297,10 +295,7 @@ export function Autocomplete(props: {
 
   function insertFileMention(input: { filePath: string; lineStart: number; lineEnd: number }) {
     const item = normalizeMentionPath(input.filePath)
-    const lineRange = {
-      startLine: input.lineStart,
-      endLine: input.lineEnd > input.lineStart ? input.lineEnd : undefined,
-    }
+    const lineRange = fileLineRange(input.lineStart, input.lineEnd)
     const { filename, part } = createFilePart({ path: item, type: "file" }, input.filePath, lineRange)
     const index = store.visible === "reference" ? store.index : props.input().cursorOffset
 
